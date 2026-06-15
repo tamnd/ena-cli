@@ -2,14 +2,14 @@ package ena
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes ena as a kit Domain: a driver that a multi-domain
+// domain.go exposes ENA as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/ena-cli/ena"
@@ -17,14 +17,11 @@ import (
 // exactly as a database/sql program enables a driver with `import _
 // "github.com/lib/pq"`. The init below registers it; the host then dereferences
 // ena:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone ena binary (see cli.NewApp), so the
+// Domain also builds the standalone ena binary (see cmd/ena/main.go), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the ena driver. It carries no state; the per-run client is
+// Domain is the ENA driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,138 +33,176 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "ena",
-			Short:  "A command line for ena.",
-			Long: `A command line for ena.
+			Short:  "Read public European Nucleotide Archive (ENA) records.",
+			Long: `Read public European Nucleotide Archive (ENA) records.
 
-ena reads public ena data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+ena reads from the EMBL-EBI ENA Portal API (1M+ studies, 312M+ sequences) over
+plain HTTPS, shapes it into clean records, and prints output that pipes into the
+rest of your tools. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/ena-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `ena page` and
-	// `ant get ena://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: keyword search across ENA studies.
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search ENA studies by keyword",
+		Args:    []kit.Arg{{Name: "query", Help: "search keyword or ENA query expression"}}}, searchStudies)
 
-	// List op: members of a page, the home of `ena links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// ena://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// study: fetch a single study by accession.
+	kit.Handle(app, kit.OpMeta{Name: "study", Group: "read", Single: true,
+		Summary: "Fetch an ENA study by accession", URIType: "study", Resolver: true,
+		Args: []kit.Arg{{Name: "accession", Help: "study accession (PRJNA…, ERP…, SRP…)"}}}, getStudy)
+
+	// sequences: search ENA sequences by keyword.
+	kit.Handle(app, kit.OpMeta{Name: "sequences", Group: "read", List: true,
+		Summary: "Search ENA sequences",
+		Args:    []kit.Arg{{Name: "query", Help: "search keyword or ENA query expression"}}}, searchSequences)
+
+	// stats: show record counts for each ENA data type.
+	kit.Handle(app, kit.OpMeta{Name: "stats", Group: "read", List: true,
+		Summary: "Show record counts for each ENA data type"}, getStats)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the ENA client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	ecfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		ecfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		ecfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		ecfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		ecfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(ecfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"           help:"search keyword or ENA query expression"`
+	Limit  int     `kit:"flag,inherit"  help:"max results"`
+	Offset int     `kit:"flag"          help:"result offset"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type studyRef struct {
+	Accession string  `kit:"arg"    help:"study accession (PRJNA…, ERP…, SRP…)"`
+	Client    *Client `kit:"inject"`
+}
+
+type sequencesInput struct {
+	Query  string  `kit:"arg"           help:"search keyword or ENA query expression"`
+	Limit  int     `kit:"flag,inherit"  help:"max results"`
+	Offset int     `kit:"flag"          help:"result offset"`
 	Client *Client `kit:"inject"`
+}
+
+type statsInput struct {
+	Client *Client `kit:"inject"`
+}
+
+// Stat is one row in the stats output.
+type Stat struct {
+	Type  string `json:"type"  kit:"id"`
+	Count int    `json:"count"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchStudies(ctx context.Context, in searchInput, emit func(*Study) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	studies, err := in.Client.SearchStudies(ctx, in.Query, limit, in.Offset)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, s := range studies {
+		if err := emit(s); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full ena.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized ena reference: %q", input)
+func getStudy(ctx context.Context, in studyRef, emit func(*Study) error) error {
+	s, err := in.Client.GetStudy(ctx, in.Accession)
+	if err != nil {
+		return mapErr(err)
 	}
-	return "page", id, nil
+	return emit(s)
+}
+
+func searchSequences(ctx context.Context, in sequencesInput, emit func(*Sequence) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	seqs, err := in.Client.SearchSequences(ctx, in.Query, limit, in.Offset)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, s := range seqs {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getStats(ctx context.Context, in statsInput, emit func(*Stat) error) error {
+	types := []string{"study", "sequence", "read_run", "sample"}
+	for _, t := range types {
+		n, err := in.Client.GetCount(ctx, t)
+		if err != nil {
+			return mapErr(fmt.Errorf("count %s: %w", t, err))
+		}
+		if err := emit(&Stat{Type: t, Count: n}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: pure string functions, no network ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// ENA study accessions start with PRJNA, ERP, SRP, DRP, or similar prefixes.
+// Any non-empty string is treated as a study accession.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty ENA reference")
+	}
+	return "study", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "study":
+		return "https://www.ebi.ac.uk/ena/browser/view/" + id, nil
+	default:
 		return "", errs.Usage("ena has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
