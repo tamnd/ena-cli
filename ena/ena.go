@@ -1,62 +1,77 @@
 // Package ena is the library behind the ena command line:
-// the HTTP client, request shaping, and the typed data models for ena.
+// the HTTP client, request shaping, and the typed data models for the
+// EMBL-EBI European Nucleotide Archive (ENA).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package ena
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to ena. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "ena/dev (+https://github.com/tamnd/ena-cli)"
+// Host is the ENA portal host, used for URI resolution and the domain Hosts list.
+const Host = "www.ebi.ac.uk"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at ena.com; change it once you
-// know the real endpoints you want to read.
-const Host = "ena.com"
+// baseURL is the ENA Portal API root every request is built from.
+const baseURL = "https://www.ebi.ac.uk/ena/portal/api"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to ena over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config carries the tunable parameters for the ENA client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns a Config with sensible defaults for the ENA Portal API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: "ena-cli/0.1.0 (github.com/tamnd/ena-cli)",
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the ENA Portal API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client with the default config.
+func NewClient() *Client {
+	return NewClientWithConfig(DefaultConfig())
+}
+
+// NewClientWithConfig returns a Client using the given config.
+func NewClientWithConfig(cfg Config) *Client {
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = baseURL
+	}
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Get fetches rawURL and returns the response body, pacing and retrying.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +79,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +88,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +121,10 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +138,178 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on ena.com. It is a stand-in for the typed records you
-// will model from the real ena endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `ena cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// buildSearchURL constructs a /search endpoint URL.
+func (c *Client) buildSearchURL(result, query, fields string, limit, offset int) string {
+	u := fmt.Sprintf("%s/search?result=%s&format=json&limit=%d&offset=%d",
+		c.cfg.BaseURL, result, limit, offset)
+	if fields != "" {
+		u += "&fields=" + url.QueryEscape(fields)
+	}
+	if query != "" {
+		u += "&query=" + url.QueryEscape(query)
+	}
+	return u
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+// --- wire types (unexported) ---
+
+// wireStudy maps the ENA /search?result=study JSON response fields.
+type wireStudy struct {
+	StudyAccession  string `json:"study_accession"`
+	StudyTitle      string `json:"study_title"`
+	Description     string `json:"description"`
+	StudyType       string `json:"study_type"`
+	TaxID           string `json:"tax_id"`
+	ScientificName  string `json:"scientific_name"`
+	FirstPublic     string `json:"first_public"`
+	LastUpdated     string `json:"last_updated"`
+	SecondaryAccess string `json:"secondary_study_accession"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// wireSequence maps the ENA /search?result=sequence JSON response fields.
+type wireSequence struct {
+	Accession      string `json:"accession"`
+	Description    string `json:"description"`
+	MolType        string `json:"mol_type"`
+	Length         string `json:"sequence_length"`
+	ScientificName string `json:"scientific_name"`
+	TaxID          string `json:"tax_id"`
+}
+
+// --- public output types ---
+
+// Study is a single ENA study record.
+type Study struct {
+	ID              string `json:"id"                        kit:"id"` // study_accession
+	Title           string `json:"title"`
+	Description     string `json:"description,omitempty"`
+	StudyType       string `json:"study_type,omitempty"`
+	TaxID           string `json:"tax_id,omitempty"`
+	Organism        string `json:"organism,omitempty"`
+	FirstPublic     string `json:"first_public,omitempty"`
+	LastUpdated     string `json:"last_updated,omitempty"`
+	SecondaryAccess string `json:"secondary_accession,omitempty"`
+}
+
+// Sequence is a single ENA sequence record.
+type Sequence struct {
+	ID          string `json:"id"          kit:"id"` // accession
+	Description string `json:"description,omitempty"`
+	MolType     string `json:"mol_type,omitempty"`
+	Length      string `json:"length,omitempty"`
+	Organism    string `json:"organism,omitempty"`
+	TaxID       string `json:"tax_id,omitempty"`
+}
+
+// --- client methods ---
+
+// GetCount returns the total record count for a result type (study, sequence, read_run, sample, …).
+// The /count endpoint returns plain text: first line is "count", second line is the integer.
+func (c *Client) GetCount(ctx context.Context, resultType string) (int, error) {
+	u := fmt.Sprintf("%s/count?result=%s&dataPortal=ena", c.cfg.BaseURL, resultType)
+	body, err := c.Get(ctx, u)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	// Response format:
+	// count
+	// 312962673
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	// Find last non-empty line that parses as an integer.
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || line == "count" {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return 0, fmt.Errorf("count parse %q: %w", line, err)
 		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("count: unexpected response: %q", string(body))
+}
+
+// SearchStudies searches ENA studies and returns up to limit records starting at offset.
+func (c *Client) SearchStudies(ctx context.Context, query string, limit, offset int) ([]*Study, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	const fields = "study_accession,study_title,description,study_type,tax_id,scientific_name,first_public,last_updated,secondary_study_accession"
+	u := c.buildSearchURL("study", query, fields, limit, offset)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var ws []wireStudy
+	if err := json.Unmarshal(body, &ws); err != nil {
+		return nil, fmt.Errorf("study search parse: %w", err)
+	}
+	out := make([]*Study, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, studyFromWire(w))
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// SearchSequences searches ENA sequences and returns up to limit records starting at offset.
+func (c *Client) SearchSequences(ctx context.Context, query string, limit, offset int) ([]*Sequence, error) {
+	if limit <= 0 {
+		limit = 10
 	}
-	return out
+	const fields = "accession,description,mol_type,sequence_length,scientific_name,tax_id"
+	u := c.buildSearchURL("sequence", query, fields, limit, offset)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var ws []wireSequence
+	if err := json.Unmarshal(body, &ws); err != nil {
+		return nil, fmt.Errorf("sequence search parse: %w", err)
+	}
+	out := make([]*Sequence, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, sequenceFromWire(w))
+	}
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// GetStudy fetches a single study by accession (e.g. PRJNA449226, ERP000958).
+func (c *Client) GetStudy(ctx context.Context, accession string) (*Study, error) {
+	q := fmt.Sprintf(`study_accession="%s"`, accession)
+	studies, err := c.SearchStudies(ctx, q, 1, 0)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	if len(studies) == 0 {
+		return nil, fmt.Errorf("study %s: not found", accession)
+	}
+	return studies[0], nil
+}
+
+// --- helpers ---
+
+func studyFromWire(w wireStudy) *Study {
+	return &Study{
+		ID:              w.StudyAccession,
+		Title:           w.StudyTitle,
+		Description:     w.Description,
+		StudyType:       w.StudyType,
+		TaxID:           w.TaxID,
+		Organism:        w.ScientificName,
+		FirstPublic:     w.FirstPublic,
+		LastUpdated:     w.LastUpdated,
+		SecondaryAccess: w.SecondaryAccess,
+	}
+}
+
+func sequenceFromWire(w wireSequence) *Sequence {
+	return &Sequence{
+		ID:          w.Accession,
+		Description: w.Description,
+		MolType:     w.MolType,
+		Length:      w.Length,
+		Organism:    w.ScientificName,
+		TaxID:       w.TaxID,
+	}
 }
